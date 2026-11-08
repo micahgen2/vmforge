@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""vmforge — download OS images and run them as VMs on your Mac.
+
+ARM64 guests (Linux, macOS) run natively through Apple's Virtualization.framework
+via the bundled `vmhost` helper (no dependencies). x86_64 guests are emulated
+with QEMU if it is installed (`brew install qemu`).
+"""
+import argparse, hashlib, json, os, re, shutil, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.environ.get("VMFORGE_HOME", os.path.expanduser("~/VMForge"))
+IMAGES, VMS, BIN = (os.path.join(HOME, d) for d in ("images", "vms", "bin"))
+VMHOST = os.path.join(BIN, "vmhost")
+NATIVE = "arm64" if os.uname().machine == "arm64" else "x86_64"
+
+def S(url, pattern, sums=None, dir_index=None, dir_pattern=None):
+    return dict(index=url, pattern=pattern, sums=sums, dir_index=dir_index, dir_pattern=dir_pattern)
+
+CATALOG = [
+    dict(id="ubuntu-server", name="Ubuntu Server (latest LTS)", src={
+        "arm64": S("https://cdimage.ubuntu.com/releases/{dir}release/", r"ubuntu-[\d.]+-live-server-arm64\.iso",
+                   "SHA256SUMS", "https://cdimage.ubuntu.com/releases/", r"\d\d\.04(\.\d+)?/"),
+        "x86_64": S("https://releases.ubuntu.com/{dir}", r"ubuntu-[\d.]+-live-server-amd64\.iso",
+                    "SHA256SUMS", "https://releases.ubuntu.com/", r"\d\d\.04(\.\d+)?/")}),
+    dict(id="ubuntu-desktop", name="Ubuntu Desktop (latest LTS)", src={
+        "arm64": S("https://cdimage.ubuntu.com/releases/{dir}release/", r"ubuntu-[\d.]+-desktop-arm64\.iso",
+                   "SHA256SUMS", "https://cdimage.ubuntu.com/releases/", r"\d\d\.04(\.\d+)?/"),
+        "x86_64": S("https://releases.ubuntu.com/{dir}", r"ubuntu-[\d.]+-desktop-amd64\.iso",
+                    "SHA256SUMS", "https://releases.ubuntu.com/", r"\d\d\.04(\.\d+)?/")}),
+    dict(id="debian", name="Debian stable (netinst)", src={
+        "arm64": S("https://cdimage.debian.org/debian-cd/current/arm64/iso-cd/", r"debian-[\d.]+-arm64-netinst\.iso", "SHA256SUMS"),
+        "x86_64": S("https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/", r"debian-[\d.]+-amd64-netinst\.iso", "SHA256SUMS")}),
+    dict(id="fedora", name="Fedora Server (netinst)", src={
+        "arm64": S("https://dl.fedoraproject.org/pub/fedora/linux/releases/{dir}Server/aarch64/iso/",
+                   r"Fedora-Server-netinst-aarch64-[\d.-]+\.iso", "auto",
+                   "https://dl.fedoraproject.org/pub/fedora/linux/releases/", r"\d+/"),
+        "x86_64": S("https://dl.fedoraproject.org/pub/fedora/linux/releases/{dir}Server/x86_64/iso/",
+                    r"Fedora-Server-netinst-x86_64-[\d.-]+\.iso", "auto",
+                    "https://dl.fedoraproject.org/pub/fedora/linux/releases/", r"\d+/")}),
+    dict(id="alpine", name="Alpine Linux (virt, tiny)", src={
+        "arm64": S("https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/", r"alpine-virt-[\d.]+-aarch64\.iso", "{file}.sha256"),
+        "x86_64": S("https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/", r"alpine-virt-[\d.]+-x86_64\.iso", "{file}.sha256")}),
+    dict(id="kali", name="Kali Linux (installer)", src={
+        "arm64": S("https://cdimage.kali.org/current/", r"kali-linux-[\d.]+-installer-arm64\.iso", "SHA256SUMS"),
+        "x86_64": S("https://cdimage.kali.org/current/", r"kali-linux-[\d.]+-installer-amd64\.iso", "SHA256SUMS")}),
+    dict(id="macos", name="macOS (latest Apple restore image, ~15 GB)", src={"arm64": dict(special="macos")}),
+]
+
+def die(msg):
+    print("error: " + msg, file=sys.stderr); sys.exit(1)
+
+def curl(*a, capture=True):
+    cmd = ["curl", "-fL", "--retry", "3", "--connect-timeout", "20"] + list(a)
+    if capture:
+        r = subprocess.run(cmd + ["-s"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode: die("request failed: " + " ".join(a)[:120])
+        return r.stdout.decode("utf-8", "replace")
+    return subprocess.run(cmd).returncode
+
+def natkey(s):
+    return [[int(n) for n in g.split(".")] for g in re.findall(r"\d+(?:\.\d+)*", s)]
+
+def hrefs(html):
+    return {os.path.basename(h.rstrip("/")) + ("/" if h.endswith("/") else "")
+            for h in re.findall(r'href="([^"?#]+)"', html)}
+
+def latest(url, pattern):
+    ms = [h for h in hrefs(curl(url)) if re.fullmatch(pattern, h)]
+    if not ms: die("no match for %s at %s" % (pattern, url))
+    return max(ms, key=natkey)
+
+def resolve(entry, arch):
+    s = entry["src"].get(arch)
+    if not s: die("%s has no %s build (available: %s)" % (entry["id"], arch, ", ".join(entry["src"])))
+    if s.get("special") == "macos":
+        if not os.path.exists(VMHOST): build()
+        url = subprocess.run([VMHOST, "macos-latest"], stdout=subprocess.PIPE, text=True).stdout.strip()
+        if not url: die("could not query latest macOS restore image")
+        return dict(url=url, file=os.path.basename(url), sha=None)
+    index = s["index"]
+    if s["dir_index"]:
+        index = index.replace("{dir}", latest(s["dir_index"], s["dir_pattern"]))
+    f = latest(index, s["pattern"])
+    return dict(url=index + f, file=f, sha=find_sha(index, f, s["sums"]))
+
+def find_sha(index, f, sums):
+    try:
+        if sums == "auto":
+            names = [h for h in hrefs(curl(index)) if "CHECKSUM" in h]
+            sums = names[0] if names else None
+        if not sums: return None
+        txt = curl(index + sums.replace("{file}", f))
+    except SystemExit:
+        return None
+    for line in txt.splitlines():
+        m = re.match(r"^([0-9a-f]{64})\s+\*?(.+)$", line) or re.match(r"^SHA256 \((.+)\) = ([0-9a-f]{64})$", line)
+        if m:
+            h, n = (m.group(1), m.group(2)) if len(m.group(1)) == 64 else (m.group(2), m.group(1))
+            if os.path.basename(n.strip()) == f: return h
+    m = re.match(r"^([0-9a-f]{64})\s*$", txt.strip().split()[0]) if txt.strip() else None
+    return m.group(1) if m and "{file}" in (sums or "") else None
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(8 << 20), b""): h.update(chunk)
+    return h.hexdigest()
+
+def entry_for(i):
+    for e in CATALOG:
+        if e["id"] == i: return e
+    die("unknown image '%s' (see: vmforge catalog)" % i)
+
+def pull(image_id, arch):
+    e = entry_for(image_id); r = resolve(e, arch)
+    os.makedirs(IMAGES, exist_ok=True)
+    dest = os.path.join(IMAGES, r["file"])
+    if os.path.exists(dest):
+        print("Already downloaded: " + dest); return dest
+    print("Downloading %s\n  from %s" % (r["file"], r["url"]))
+    part = dest + ".part"
+    if curl("-C", "-", "--progress-bar", "-o", part, r["url"], capture=False):
+        die("download failed (re-run to resume)")
+    if r["sha"]:
+        print("Verifying SHA-256…")
+        if sha256(part) != r["sha"]:
+            die("checksum mismatch — file kept as %s, delete it and retry" % part)
+        print("  checksum OK")
+    else:
+        print("  (no checksum published for this image; not verified)")
+    os.rename(part, dest); print("Saved: " + dest)
+    return dest
+
+def build():
+    os.makedirs(BIN, exist_ok=True)
+    print("Compiling vmhost (Virtualization.framework helper)…")
+    if subprocess.run(["swiftc", "-O", os.path.join(HERE, "vmhost.swift"), "-o", VMHOST]).returncode:
+        die("swiftc failed — install Xcode command line tools: xcode-select --install")
+    if subprocess.run(["codesign", "--force", "-s", "-", "--entitlements",
+                       os.path.join(HERE, "vmhost.entitlements"), VMHOST]).returncode:
+        die("codesign failed")
+    print("Built " + VMHOST)
+
+def vmdir(name): return os.path.join(VMS, name)
+def load(name):
+    p = os.path.join(vmdir(name), "vm.json")
+    if not os.path.exists(p): die("no such VM '%s' (see: vmforge ls)" % name)
+    return json.load(open(p))
+def save(cfg):
+    json.dump(cfg, open(os.path.join(vmdir(cfg["name"]), "vm.json"), "w"), indent=2)
+
+def create(name, image, arch, cpus, mem, disk, iso=None):
+    if os.path.exists(vmdir(name)): die("VM '%s' already exists" % name)
+    macos = image == "macos"
+    if iso is None and image:
+        iso = pull(image, arch)
+    kind = "macos" if macos else ("linux" if arch == "arm64" else "qemu")
+    if arch != NATIVE and kind != "qemu": die("cannot natively run %s guests on this Mac" % arch)
+    os.makedirs(vmdir(name))
+    cfg = dict(name=name, kind=kind, arch=arch, cpus=cpus, memoryMB=mem, diskGB=disk,
+               iso=None if macos else iso, ipsw=iso if macos else None,
+               width=1920 if macos else 1440, height=1200 if macos else 900)
+    save(cfg)
+    if macos:
+        if not os.path.exists(VMHOST): build()
+        subprocess.run([VMHOST, "macos-install", vmdir(name), iso]) .returncode and die("macOS install failed")
+    print("Created VM '%s'. Start it with: vmforge run %s" % (name, name))
+
+def run(name):
+    cfg = load(name); d = vmdir(name)
+    if cfg["kind"] == "qemu":
+        q = shutil.which("qemu-system-x86_64")
+        if not q: die("QEMU is needed for x86_64 emulation. Install Homebrew (brew.sh), then: brew install qemu")
+        disk = os.path.join(d, "disk.img")
+        if not os.path.exists(disk):
+            with open(disk, "wb") as f: f.truncate(cfg["diskGB"] << 30)
+        cmd = [q, "-machine", "q35", "-accel", "tcg,thread=multi", "-cpu", "max",
+               "-smp", str(cfg["cpus"]), "-m", str(cfg["memoryMB"]),
+               "-drive", "file=%s,format=raw,if=virtio" % disk,
+               "-nic", "user,model=virtio-net-pci", "-device", "virtio-vga", "-device", "qemu-xhci",
+               "-device", "usb-tablet", "-display", "cocoa", "-name", name]
+        if cfg.get("iso"): cmd += ["-cdrom", cfg["iso"], "-boot", "order=dc"]
+        print("Emulating x86_64 (slow — expect 5-10x slower than native)…")
+        sys.exit(subprocess.call(cmd))
+    if not os.path.exists(VMHOST): build()
+    sys.exit(subprocess.call([VMHOST, "run", d]))
+
+def eject(name):
+    cfg = load(name); cfg["iso"] = None; save(cfg)
+    print("Installer ISO detached — '%s' will boot from its disk." % name)
+
+def ls():
+    if not os.path.isdir(VMS) or not os.listdir(VMS): print("No VMs yet. Try: vmforge up alpine"); return
+    print("%-18s %-7s %-7s %5s %7s %6s  %s" % ("NAME", "KIND", "ARCH", "CPUS", "MEM MB", "DISK", "ISO"))
+    for n in sorted(os.listdir(VMS)):
+        try: c = load(n)
+        except SystemExit: continue
+        print("%-18s %-7s %-7s %5d %7d %5dG  %s" % (n, c["kind"], c["arch"], c["cpus"], c["memoryMB"], c["diskGB"],
+                                                     os.path.basename(c["iso"]) if c.get("iso") else "-"))
+
+def catalog(arch):
+    print("%-15s %-46s %s" % ("ID", "NAME", "ARCH"))
+    for e in CATALOG:
+        print("%-15s %-46s %s" % (e["id"], e["name"], ", ".join(e["src"])))
+    print("\nUse --arch x86_64 for Intel guests (emulated, needs QEMU). Default: %s (native)." % NATIVE)
+
+def images():
+    if not os.path.isdir(IMAGES): print("No downloaded images."); return
+    for f in sorted(os.listdir(IMAGES)):
+        print("%8.1f MB  %s" % (os.path.getsize(os.path.join(IMAGES, f)) / 1e6, f))
+
+def doctor():
+    print("Mac: %s, macOS %s" % (os.uname().machine, subprocess.run(["sw_vers", "-productVersion"], stdout=subprocess.PIPE, text=True).stdout.strip()))
+    print("vmhost (native ARM64 Linux/macOS): %s" % ("built" if os.path.exists(VMHOST) else "not built yet — builds on first use"))
+    print("swiftc: %s" % (shutil.which("swiftc") or "MISSING (xcode-select --install)"))
+    print("QEMU (x86_64 emulation): %s" % (shutil.which("qemu-system-x86_64") or "not installed (brew install qemu)"))
+    print("Storage: " + HOME)
+
+def menu():
+    print("vmforge — pick an OS to download and boot\n")
+    for i, e in enumerate(CATALOG, 1): print(" %d) %s" % (i, e["name"]))
+    try:
+        e = CATALOG[int(input("\nNumber: ")) - 1]
+        name = input("VM name [%s]: " % e["id"]).strip() or e["id"]
+    except (ValueError, IndexError, EOFError): die("cancelled")
+    up(e["id"], name, NATIVE, 4, 4096, 40)
+
+def up(image, name, arch, cpus, mem, disk):
+    name = name or image
+    if not os.path.exists(vmdir(name)): create(name, image, arch, cpus, mem, disk)
+    if image != "macos" or True: run(name)
+
+def main():
+    p = argparse.ArgumentParser(prog="vmforge", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("catalog", help="list downloadable OS images")
+    sub.add_parser("images", help="list downloaded images")
+    sub.add_parser("ls", help="list VMs")
+    sub.add_parser("doctor", help="check your setup")
+    sub.add_parser("build", help="(re)build the native VM helper")
+    a = sub.add_parser("pull", help="download an image"); a.add_argument("image"); a.add_argument("--arch", default=NATIVE)
+    def vmopts(x):
+        x.add_argument("--arch", default=NATIVE, choices=["arm64", "x86_64"])
+        x.add_argument("--cpus", type=int, default=4); x.add_argument("--mem", type=int, default=4096, help="MB")
+        x.add_argument("--disk", type=int, default=40, help="GB (sparse)")
+    c = sub.add_parser("create", help="create a VM from a catalog image or your own ISO")
+    c.add_argument("name"); c.add_argument("image", nargs="?"); c.add_argument("--iso", help="path to your own ISO"); vmopts(c)
+    u = sub.add_parser("up", help="download + create + start in one go"); u.add_argument("image"); u.add_argument("name", nargs="?"); vmopts(u)
+    for n, h in (("run", "start a VM"), ("eject", "detach installer ISO after installing"), ("rm", "delete a VM")):
+        sub.add_parser(n, help=h).add_argument("name")
+    a = p.parse_args()
+    if a.cmd == "catalog": catalog(NATIVE)
+    elif a.cmd == "images": images()
+    elif a.cmd == "ls": ls()
+    elif a.cmd == "doctor": doctor()
+    elif a.cmd == "build": build()
+    elif a.cmd == "pull": pull(a.image, a.arch)
+    elif a.cmd == "create":
+        if not a.image and not a.iso: die("give a catalog image id or --iso PATH")
+        create(a.name, a.image if not a.iso else None, a.arch, a.cpus, a.mem, a.disk, a.iso)
+    elif a.cmd == "up": up(a.image, a.name, a.arch, a.cpus, a.mem, a.disk)
+    elif a.cmd == "run": run(a.name)
+    elif a.cmd == "eject": eject(a.name)
+    elif a.cmd == "rm":
+        load(a.name)
+        if input("Delete VM '%s' and its disk? [y/N] " % a.name).lower() == "y": shutil.rmtree(vmdir(a.name)); print("Deleted.")
+    else: menu()
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: print()
