@@ -23,6 +23,13 @@ final class Backend: ObservableObject {
     let script = (Bundle.main.resourcePath ?? ".") + "/vmforge"
     let home = ProcessInfo.processInfo.environment["VMFORGE_HOME"] ?? (NSHomeDirectory() + "/VMForge")
 
+    var hasDevTools: Bool {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select"); p.arguments = ["-p"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit(); return p.terminationStatus == 0
+    }
+
     var hasQemu: Bool {
         ["/opt/homebrew/bin", "/usr/local/bin"].contains { FileManager.default.fileExists(atPath: $0 + "/qemu-system-x86_64") }
     }
@@ -143,8 +150,25 @@ struct ContentView: View {
     @EnvironmentObject var be: Backend
     @State private var selection: String?
     @State private var showNew = false
+    @State private var devTools = true
 
     var body: some View {
+        VStack(spacing: 0) {
+            if !devTools {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("Xcode Command Line Tools are required to run VMs. Open Terminal and run:  xcode-select --install")
+                        .font(.callout).textSelection(.enabled)
+                    Spacer()
+                    Button("Re-check") { devTools = be.hasDevTools }
+                }.padding(10).background(.orange.opacity(0.15))
+            }
+            mainView
+        }
+        .onAppear { devTools = be.hasDevTools }
+    }
+
+    var mainView: some View {
         NavigationSplitView {
             List(selection: $selection) {
                 ForEach(be.vms) { vm in

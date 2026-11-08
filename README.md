@@ -5,6 +5,10 @@ Download OS images and run them as VMs on your Mac.
 - **ARM64 guests (Linux, macOS)** run at near-native speed via Apple's Virtualization.framework (no dependencies; the helper compiles itself on first use).
 - **x86_64 guests** are emulated with QEMU (`brew install qemu`), much slower.
 
+> **Requires the Xcode Command Line Tools.** vmforge compiles its small VM helper (`vmhost`) the first
+> time you run a VM, which needs `swiftc` and `codesign`. Install them once with `xcode-select --install`
+> (the full Xcode app is not required). Also needs an Apple Silicon Mac on macOS 13 or later.
+
 ```bash
 ./vmforge catalog                 # what you can download
 ./vmforge up alpine               # download + create + boot (try this first, ~70 MB)
