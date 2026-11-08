@@ -18,3 +18,10 @@ Download OS images and run them as VMs on your Mac.
 After installing a Linux guest, run `./vmforge eject NAME` so it boots from its disk.
 Everything lives in `~/VMForge` (override with `VMFORGE_HOME`). Downloads resume and are SHA-256 verified.
 Closing the VM window hard-stops the guest, so shut down from inside the OS first.
+
+## GUI
+
+```bash
+./build-gui.sh && open VMForge.app
+```
+A native SwiftUI window: create VMs from the catalog (or your own ISO) with progress, then start, stop, eject and delete them. It drives the same `vmforge` CLI.

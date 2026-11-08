@@ -189,7 +189,13 @@ def eject(name):
     cfg = load(name); cfg["iso"] = None; save(cfg)
     print("Installer ISO detached — '%s' will boot from its disk." % name)
 
-def ls():
+def ls(as_json=False):
+    if as_json:
+        out = []
+        for n in sorted(os.listdir(VMS)) if os.path.isdir(VMS) else []:
+            try: out.append(load(n))
+            except SystemExit: pass
+        print(json.dumps(out)); return
     if not os.path.isdir(VMS) or not os.listdir(VMS): print("No VMs yet. Try: vmforge up alpine"); return
     print("%-18s %-7s %-7s %5s %7s %6s  %s" % ("NAME", "KIND", "ARCH", "CPUS", "MEM MB", "DISK", "ISO"))
     for n in sorted(os.listdir(VMS)):
@@ -198,7 +204,9 @@ def ls():
         print("%-18s %-7s %-7s %5d %7d %5dG  %s" % (n, c["kind"], c["arch"], c["cpus"], c["memoryMB"], c["diskGB"],
                                                      os.path.basename(c["iso"]) if c.get("iso") else "-"))
 
-def catalog(arch):
+def catalog(arch, as_json=False):
+    if as_json:
+        print(json.dumps([dict(id=e["id"], name=e["name"], arch=list(e["src"])) for e in CATALOG])); return
     print("%-15s %-46s %s" % ("ID", "NAME", "ARCH"))
     for e in CATALOG:
         print("%-15s %-46s %s" % (e["id"], e["name"], ", ".join(e["src"])))
@@ -233,9 +241,9 @@ def up(image, name, arch, cpus, mem, disk):
 def main():
     p = argparse.ArgumentParser(prog="vmforge", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("catalog", help="list downloadable OS images")
+    sub.add_parser("catalog", help="list downloadable OS images").add_argument("--json", action="store_true")
     sub.add_parser("images", help="list downloaded images")
-    sub.add_parser("ls", help="list VMs")
+    sub.add_parser("ls", help="list VMs").add_argument("--json", action="store_true")
     sub.add_parser("doctor", help="check your setup")
     sub.add_parser("build", help="(re)build the native VM helper")
     a = sub.add_parser("pull", help="download an image"); a.add_argument("image"); a.add_argument("--arch", default=NATIVE)
@@ -247,11 +255,12 @@ def main():
     c.add_argument("name"); c.add_argument("image", nargs="?"); c.add_argument("--iso", help="path to your own ISO"); vmopts(c)
     u = sub.add_parser("up", help="download + create + start in one go"); u.add_argument("image"); u.add_argument("name", nargs="?"); vmopts(u)
     for n, h in (("run", "start a VM"), ("eject", "detach installer ISO after installing"), ("rm", "delete a VM")):
-        sub.add_parser(n, help=h).add_argument("name")
+        x = sub.add_parser(n, help=h); x.add_argument("name")
+        if n == "rm": x.add_argument("--yes", action="store_true", help="don't ask")
     a = p.parse_args()
-    if a.cmd == "catalog": catalog(NATIVE)
+    if a.cmd == "catalog": catalog(NATIVE, a.json)
     elif a.cmd == "images": images()
-    elif a.cmd == "ls": ls()
+    elif a.cmd == "ls": ls(a.json)
     elif a.cmd == "doctor": doctor()
     elif a.cmd == "build": build()
     elif a.cmd == "pull": pull(a.image, a.arch)
@@ -263,7 +272,7 @@ def main():
     elif a.cmd == "eject": eject(a.name)
     elif a.cmd == "rm":
         load(a.name)
-        if input("Delete VM '%s' and its disk? [y/N] " % a.name).lower() == "y": shutil.rmtree(vmdir(a.name)); print("Deleted.")
+        if a.yes or input("Delete VM '%s' and its disk? [y/N] " % a.name).lower() == "y": shutil.rmtree(vmdir(a.name)); print("Deleted.")
     else: menu()
 
 if __name__ == "__main__":
