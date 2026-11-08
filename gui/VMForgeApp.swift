@@ -23,6 +23,17 @@ final class Backend: ObservableObject {
     let script = (Bundle.main.resourcePath ?? ".") + "/vmforge"
     let home = ProcessInfo.processInfo.environment["VMFORGE_HOME"] ?? (NSHomeDirectory() + "/VMForge")
 
+    var hostMB: Int { Int(ProcessInfo.processInfo.physicalMemory >> 20) }
+    var memOptions: [Int] { [2048, 4096, 6144, 8192, 12288, 16384].filter { $0 <= max(hostMB / 2, 2048) } }
+    var defaultMem: Int { max(2048, min(8192, hostMB / 4 / 512 * 512)) }
+
+    func setSpec(_ vm: VM, cpus: Int? = nil, mem: Int? = nil) {
+        var a = ["set", vm.name]
+        if let c = cpus { a += ["--cpus", String(c)] }
+        if let m = mem { a += ["--mem", String(m)] }
+        let p = makeProcess(a); try? p.run(); p.waitUntilExit(); reload()
+    }
+
     var hasDevTools: Bool {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select"); p.arguments = ["-p"]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
@@ -215,8 +226,14 @@ struct DetailView: View {
             }
             Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
                 GridRow { Text("Type").foregroundStyle(.secondary); Text(vm.kind == "macos" ? "macOS (native)" : vm.kind == "qemu" ? "x86_64 (emulated via QEMU)" : "Linux ARM64 (native)") }
-                GridRow { Text("CPUs").foregroundStyle(.secondary); Text("\(vm.cpus)") }
-                GridRow { Text("Memory").foregroundStyle(.secondary); Text("\(vm.memoryMB / 1024) GB") }
+                GridRow { Text("CPUs").foregroundStyle(.secondary)
+                    Picker("", selection: Binding(get: { vm.cpus }, set: { be.setSpec(vm, cpus: $0) })) {
+                        ForEach([1, 2, 4, 6, 8], id: \.self) { Text("\($0)").tag($0) }
+                    }.labelsHidden().fixedSize().disabled(on) }
+                GridRow { Text("Memory").foregroundStyle(.secondary)
+                    Picker("", selection: Binding(get: { vm.memoryMB }, set: { be.setSpec(vm, mem: $0) })) {
+                        ForEach(Array(Set(be.memOptions + [vm.memoryMB])).sorted(), id: \.self) { Text("\(Double($0) / 1024, specifier: "%g") GB").tag($0) }
+                    }.labelsHidden().fixedSize().disabled(on) }
                 GridRow { Text("Disk").foregroundStyle(.secondary); Text("\(vm.diskGB) GB (grows as used)") }
                 GridRow { Text("Installer ISO").foregroundStyle(.secondary); Text(vm.iso.map { ($0 as NSString).lastPathComponent } ?? "none — boots from disk") }
             }
@@ -232,6 +249,10 @@ struct DetailView: View {
                 }
                 Spacer()
                 Button(role: .destructive) { confirmDelete = true } label: { Label("Delete", systemImage: "trash") }
+            }
+            if vm.memoryMB > be.hostMB / 2 {
+                Label("This VM has more than half of your Mac's RAM. Your Mac will swap and the VM can freeze — lower the memory above (stop the VM first).", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout).foregroundStyle(.orange)
             }
             if on { Text("Shut the guest down from inside its OS when you can — closing the window or Stop is like pulling the power.")
                 .font(.footnote).foregroundStyle(.secondary) }
@@ -257,6 +278,7 @@ struct NewVMSheet: View {
     @State private var name = ""
     @State private var cpus = 4
     @State private var mem = 4096
+    @State private var memSet = false
     @State private var disk = 40
     @State private var ownISO = false
     @State private var isoPath: String?
@@ -294,7 +316,7 @@ struct NewVMSheet: View {
                 TextField("Name", text: $name, prompt: Text(imageID))
                 Stepper("CPUs: \(cpus)", value: $cpus, in: 1...16)
                 Picker("Memory", selection: $mem) {
-                    ForEach([2048, 4096, 8192, 16384], id: \.self) { Text("\($0 / 1024) GB").tag($0) }
+                    ForEach(be.memOptions, id: \.self) { Text("\(Double($0) / 1024, specifier: "%g") GB").tag($0) }
                 }
                 Stepper("Disk: \(disk) GB", value: $disk, in: 8...500, step: 8)
                 if !nameOK { Text("Name must be unique and use letters, numbers, . _ -").font(.footnote).foregroundStyle(.red) }
@@ -320,11 +342,11 @@ struct NewVMSheet: View {
             }
         }
         .padding(22).frame(width: 520)
-        .onChange(of: imageID) { _ in if imageID == "macos" { arch = "arm64"; mem = max(mem, 8192); disk = max(disk, 80) } }
+        .onChange(of: imageID) { _ in if imageID == "macos" { arch = "arm64"; mem = min(max(mem, 4096), be.memOptions.last ?? 4096); disk = max(disk, 80) } }
         .onChange(of: ownISO) { _ in if ownISO { arch = "arm64" } }
         .fileImporter(isPresented: $picking, allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data]) { r in
             if case .success(let u) = r { isoPath = u.path }
         }
-        .onAppear { be.log = ""; be.failed = false }
+        .onAppear { be.log = ""; be.failed = false; mem = be.defaultMem }
     }
 }

@@ -11,6 +11,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 HOME = os.environ.get("VMFORGE_HOME", os.path.expanduser("~/VMForge"))
 IMAGES, VMS, BIN = (os.path.join(HOME, d) for d in ("images", "vms", "bin"))
 VMHOST = os.path.join(BIN, "vmhost")
+HOSTMB = int(subprocess.run(["sysctl", "-n", "hw.memsize"], stdout=subprocess.PIPE, text=True).stdout.strip() or 0) // (1 << 20) or 16384
+DEFMEM = max(2048, min(8192, HOSTMB // 4 // 512 * 512))   # a quarter of host RAM
 NATIVE = "arm64" if os.uname().machine == "arm64" else "x86_64"
 
 def S(url, pattern, sums=None, dir_index=None, dir_pattern=None):
@@ -152,6 +154,9 @@ def save(cfg):
 def create(name, image, arch, cpus, mem, disk, iso=None):
     if os.path.exists(vmdir(name)): die("VM '%s' already exists" % name)
     macos = image == "macos"
+    if mem > HOSTMB // 2:
+        print("warning: %d MB is more than half of this Mac's %d MB RAM; the host will swap and the VM may freeze. "
+              "Consider --mem %d." % (mem, HOSTMB, DEFMEM), file=sys.stderr)
     if iso is None and image:
         iso = pull(image, arch)
     kind = "macos" if macos else ("linux" if arch == "arm64" else "qemu")
@@ -184,6 +189,14 @@ def run(name):
         sys.exit(subprocess.call(cmd))
     if not os.path.exists(VMHOST): build()
     sys.exit(subprocess.call([VMHOST, "run", d]))
+
+def setspec(name, cpus, mem):
+    cfg = load(name)
+    if cpus: cfg["cpus"] = cpus
+    if mem:
+        if mem > HOSTMB // 2: print("warning: more than half of host RAM (%d MB) — may cause freezes" % HOSTMB, file=sys.stderr)
+        cfg["memoryMB"] = mem
+    save(cfg); print("Updated '%s': %d CPUs, %d MB" % (name, cfg["cpus"], cfg["memoryMB"]))
 
 def eject(name):
     cfg = load(name); cfg["iso"] = None; save(cfg)
@@ -231,7 +244,7 @@ def menu():
         e = CATALOG[int(input("\nNumber: ")) - 1]
         name = input("VM name [%s]: " % e["id"]).strip() or e["id"]
     except (ValueError, IndexError, EOFError): die("cancelled")
-    up(e["id"], name, NATIVE, 4, 4096, 40)
+    up(e["id"], name, NATIVE, 4, DEFMEM, 40)
 
 def up(image, name, arch, cpus, mem, disk):
     name = name or image
@@ -249,11 +262,13 @@ def main():
     a = sub.add_parser("pull", help="download an image"); a.add_argument("image"); a.add_argument("--arch", default=NATIVE)
     def vmopts(x):
         x.add_argument("--arch", default=NATIVE, choices=["arm64", "x86_64"])
-        x.add_argument("--cpus", type=int, default=4); x.add_argument("--mem", type=int, default=4096, help="MB")
+        x.add_argument("--cpus", type=int, default=4); x.add_argument("--mem", type=int, default=DEFMEM, help="MB (default: a quarter of your RAM)")
         x.add_argument("--disk", type=int, default=40, help="GB (sparse)")
     c = sub.add_parser("create", help="create a VM from a catalog image or your own ISO")
     c.add_argument("name"); c.add_argument("image", nargs="?"); c.add_argument("--iso", help="path to your own ISO"); vmopts(c)
     u = sub.add_parser("up", help="download + create + start in one go"); u.add_argument("image"); u.add_argument("name", nargs="?"); vmopts(u)
+    st = sub.add_parser("set", help="change a VM's CPUs / memory (VM must be stopped)")
+    st.add_argument("name"); st.add_argument("--cpus", type=int); st.add_argument("--mem", type=int, help="MB")
     for n, h in (("run", "start a VM"), ("eject", "detach installer ISO after installing"), ("rm", "delete a VM")):
         x = sub.add_parser(n, help=h); x.add_argument("name")
         if n == "rm": x.add_argument("--yes", action="store_true", help="don't ask")
@@ -269,6 +284,7 @@ def main():
         create(a.name, a.image if not a.iso else None, a.arch, a.cpus, a.mem, a.disk, a.iso)
     elif a.cmd == "up": up(a.image, a.name, a.arch, a.cpus, a.mem, a.disk)
     elif a.cmd == "run": run(a.name)
+    elif a.cmd == "set": setspec(a.name, a.cpus, a.mem)
     elif a.cmd == "eject": eject(a.name)
     elif a.cmd == "rm":
         load(a.name)
