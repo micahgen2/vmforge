@@ -206,12 +206,14 @@ def ls(as_json=False):
     if as_json:
         out = []
         for n in sorted(os.listdir(VMS)) if os.path.isdir(VMS) else []:
+            if not os.path.isdir(vmdir(n)): continue
             try: out.append(load(n))
             except SystemExit: pass
         print(json.dumps(out)); return
     if not os.path.isdir(VMS) or not os.listdir(VMS): print("No VMs yet. Try: vmforge up alpine"); return
     print("%-18s %-7s %-7s %5s %7s %6s  %s" % ("NAME", "KIND", "ARCH", "CPUS", "MEM MB", "DISK", "ISO"))
     for n in sorted(os.listdir(VMS)):
+        if not os.path.isdir(vmdir(n)): continue
         try: c = load(n)
         except SystemExit: continue
         print("%-18s %-7s %-7s %5d %7d %5dG  %s" % (n, c["kind"], c["arch"], c["cpus"], c["memoryMB"], c["diskGB"],
